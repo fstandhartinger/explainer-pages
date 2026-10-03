@@ -8,6 +8,12 @@ const http = require('http'), fs = require('fs'), zlib = require('zlib'), crypto
 
 const PORT = +process.env.PORT || 8080;
 const MODEL = process.env.ASK_MODEL || 'anthropic/claude-sonnet-5.5';
+// Fallback when OpenRouter fails (e.g. 402 out of credits): Chutes, OpenAI-compatible, key in CHUTES_API_KEY.
+const FALLBACK_MODEL = process.env.ASK_FALLBACK_MODEL || 'moonshotai/Kimi-K3-TEE';
+const PROVIDERS = () => [
+  process.env.OPENROUTER_API_KEY && { url: 'https://openrouter.ai/api/v1/chat/completions', key: process.env.OPENROUTER_API_KEY, model: MODEL, maxTokens: 1500, extra: { 'X-Title': 'explainer-pages' } },
+  process.env.CHUTES_API_KEY && { url: 'https://llm.chutes.ai/v1/chat/completions', key: process.env.CHUTES_API_KEY, model: FALLBACK_MODEL, maxTokens: 4000, extra: {} },
+].filter(Boolean);
 const DAILY_CAP = +process.env.ASK_DAILY_CAP || 300;          // all pages, all users, per UTC day
 const IP_10MIN = +process.env.ASK_PER_IP_10MIN || 10;
 const IP_DAY = +process.env.ASK_PER_IP_DAY || 60;
@@ -82,7 +88,7 @@ async function ask(req, res) {
   const pd = pageData(slug);
   if (!pd) return json(res, 404, { error: 'Unbekannte Seite.' });
   if (question.length < 3) return json(res, 400, { error: 'Bitte eine Frage eingeben.' });
-  if (!process.env.OPENROUTER_API_KEY) return json(res, 503, { error: 'Frage-Funktion nicht konfiguriert.' });
+  if (!PROVIDERS().length) return json(res, 503, { error: 'Frage-Funktion nicht konfiguriert.' });
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
   const limited = allow(ip); if (limited) return json(res, 429, { error: limited });
 
@@ -99,21 +105,24 @@ async function ask(req, res) {
     '', '## Narration transcript', transcript.slice(0, 12000),
     '', '## The point the reader clicked', point ? JSON.stringify({ id: pointId, title: point.title, short: point.short, more: point.more, sources: point.sources }).slice(0, 4000) : '(none — general question)',
   ].join('\n');
-  try {
-    const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 60e3);
-    const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST', signal: ctl.signal,
-      headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'X-Title': 'explainer-pages' },
-      body: JSON.stringify({ model: MODEL, max_tokens: 1500, temperature: 0.2,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: question }] }),
-    });
-    clearTimeout(timer);
-    const d = await r.json().catch(() => ({}));
-    const answer = d.choices?.[0]?.message?.content;
-    if (!r.ok || !answer) { console.error('ask upstream', r.status, JSON.stringify(d).slice(0, 300)); return json(res, 502, { error: 'Das Modell hat gerade nicht geantwortet — bitte nochmal versuchen.' }); }
-    console.log(`ask page=${slug} point=${pointId} q=${question.length}c ok`);
-    json(res, 200, { answer: answer.trim(), model: MODEL });
-  } catch (e) { console.error('ask error', e.message); json(res, 504, { error: 'Zeitüberschreitung — bitte nochmal versuchen.' }); }
+  for (const pv of PROVIDERS()) {
+    try {
+      const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 60e3);
+      const r = await fetch(pv.url, {
+        method: 'POST', signal: ctl.signal,
+        headers: { Authorization: `Bearer ${pv.key}`, 'Content-Type': 'application/json', ...pv.extra },
+        body: JSON.stringify({ model: pv.model, max_tokens: pv.maxTokens, temperature: 0.2,
+          messages: [{ role: 'system', content: system }, { role: 'user', content: question }] }),
+      });
+      clearTimeout(timer);
+      const d = await r.json().catch(() => ({}));
+      const answer = d.choices?.[0]?.message?.content;
+      if (!r.ok || !answer) { console.error('ask upstream', pv.model, r.status, JSON.stringify(d).slice(0, 300)); continue; }
+      console.log(`ask page=${slug} point=${pointId} q=${question.length}c ok model=${pv.model}`);
+      return json(res, 200, { answer: answer.trim(), model: pv.model });
+    } catch (e) { console.error('ask error', pv.model, e.message); }
+  }
+  json(res, 502, { error: 'Das Modell hat gerade nicht geantwortet — bitte nochmal versuchen.' });
 }
 
 http.createServer((req, res) => {
@@ -128,4 +137,4 @@ http.createServer((req, res) => {
     return serveFile(req, res, `${m[1]}/${rel}`);
   }
   send(res, 404, 'not found', { 'Content-Type': 'text/plain' });
-}).listen(PORT, () => console.log(`explainer-pages on :${PORT}, model ${MODEL}`));
+}).listen(PORT, () => console.log(`explainer-pages on :${PORT}, model ${MODEL}, fallback ${FALLBACK_MODEL}`));
