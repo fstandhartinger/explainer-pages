@@ -8,7 +8,7 @@ const files = {};
 (function walk(d) {
   for (const e of fs.readdirSync(d, { withFileTypes: true })) {
     const p = path.join(d, e.name);
-    if (e.isDirectory()) walk(p);
+    if (e.isDirectory()) { if (!/^(stage-check|check|check-live|frames)$/.test(e.name)) walk(p); }  // QA screenshots are never served; keeps bundle < GitHub's 100 MiB
     else if (!/\.(mp4|wav)$/.test(e.name) && !e.name.startsWith('.')) files[path.relative(dir, p).split(path.sep).join('/')] = fs.readFileSync(p).toString('base64');
   }
 })(dir);
