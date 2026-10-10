@@ -24,10 +24,14 @@ function loadBundle() {
   const parts = fs.readdirSync(__dirname).filter((f) => /^bundle\.enc\.\d+$/.test(f)).sort((a, b) => a.split('.').pop() - b.split('.').pop());
   const files = parts.length ? parts : fs.existsSync(path.join(__dirname, 'bundle.enc')) ? ['bundle.enc'] : [];
   if (!keyHex || !files.length) { console.error('no bundle or key; serving nothing'); return new Map(); }
-  const buf = Buffer.concat(files.map((f) => fs.readFileSync(path.join(__dirname, f)))), iv = buf.subarray(0, 12), tag = buf.subarray(12, 28), ct = buf.subarray(28);
-  const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), iv); d.setAuthTag(tag);
-  const pages = JSON.parse(zlib.gunzipSync(Buffer.concat([d.update(ct), d.final()])).toString('utf8'));
-  const m = new Map(Object.entries(pages).map(([k, v]) => [k, Buffer.from(v, 'base64')]));
+  // Keep startup memory low (container limit 768 MB): drop each intermediate copy as soon as it is used.
+  let buf = Buffer.concat(files.map((f) => fs.readFileSync(path.join(__dirname, f))));
+  const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), buf.subarray(0, 12)); d.setAuthTag(buf.subarray(12, 28));
+  let plain = Buffer.concat([d.update(buf.subarray(28)), d.final()]); buf = null;
+  let text = zlib.gunzipSync(plain).toString('latin1'); plain = null;   // base64 + JSON are ASCII: latin1 keeps V8's one-byte string
+  const pages = JSON.parse(text); text = null;
+  const m = new Map();
+  for (const k of Object.keys(pages)) { m.set(k, Buffer.from(pages[k], 'base64')); delete pages[k]; }
   console.log(`bundle: ${m.size} files, pages: ${[...new Set([...m.keys()].map((k) => k.split('/')[0]))].length}`);
   return m;
 }
