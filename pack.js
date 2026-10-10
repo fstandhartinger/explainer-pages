@@ -14,5 +14,7 @@ const files = {};
 })(dir);
 const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), iv);
 const ct = Buffer.concat([c.update(zlib.gzipSync(Buffer.from(JSON.stringify(files)))), c.final()]);
-fs.writeFileSync(out, Buffer.concat([iv, c.getAuthTag(), ct]));
-console.log(`packed ${Object.keys(files).length} files -> ${out} (${(fs.statSync(out).size / 1e6).toFixed(1)} MB)`);
+const blob = Buffer.concat([iv, c.getAuthTag(), ct]), PART = 90e6;   // GitHub rejects files > 100 MiB, so ship parts
+for (const f of fs.readdirSync(path.dirname(path.resolve(out)))) if (f.startsWith(path.basename(out))) fs.unlinkSync(path.join(path.dirname(path.resolve(out)), f));
+for (let i = 0; i * PART < blob.length; i++) fs.writeFileSync(`${out}.${i}`, blob.subarray(i * PART, (i + 1) * PART));
+console.log(`packed ${Object.keys(files).length} files -> ${out}.* (${(blob.length / 1e6).toFixed(1)} MB in ${Math.ceil(blob.length / PART)} parts)`);

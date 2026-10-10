@@ -20,12 +20,14 @@ const IP_DAY = +process.env.ASK_PER_IP_DAY || 60;
 
 function loadBundle() {
   const keyHex = process.env.EXPLAINER_BUNDLE_KEY || '';
-  const file = path.join(__dirname, 'bundle.enc');
-  if (!keyHex || !fs.existsSync(file)) { console.error('no bundle or key; serving nothing'); return new Map(); }
-  const buf = fs.readFileSync(file), iv = buf.subarray(0, 12), tag = buf.subarray(12, 28), ct = buf.subarray(28);
+  // bundle.enc.0, .1, … (split to stay under GitHub's file limit); a single bundle.enc still works
+  const parts = fs.readdirSync(__dirname).filter((f) => /^bundle\.enc\.\d+$/.test(f)).sort((a, b) => a.split('.').pop() - b.split('.').pop());
+  const files = parts.length ? parts : fs.existsSync(path.join(__dirname, 'bundle.enc')) ? ['bundle.enc'] : [];
+  if (!keyHex || !files.length) { console.error('no bundle or key; serving nothing'); return new Map(); }
+  const buf = Buffer.concat(files.map((f) => fs.readFileSync(path.join(__dirname, f)))), iv = buf.subarray(0, 12), tag = buf.subarray(12, 28), ct = buf.subarray(28);
   const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), iv); d.setAuthTag(tag);
-  const files = JSON.parse(zlib.gunzipSync(Buffer.concat([d.update(ct), d.final()])).toString('utf8'));
-  const m = new Map(Object.entries(files).map(([k, v]) => [k, Buffer.from(v, 'base64')]));
+  const pages = JSON.parse(zlib.gunzipSync(Buffer.concat([d.update(ct), d.final()])).toString('utf8'));
+  const m = new Map(Object.entries(pages).map(([k, v]) => [k, Buffer.from(v, 'base64')]));
   console.log(`bundle: ${m.size} files, pages: ${[...new Set([...m.keys()].map((k) => k.split('/')[0]))].length}`);
   return m;
 }
