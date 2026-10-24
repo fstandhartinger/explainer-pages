@@ -5,6 +5,7 @@
 // never listed, so a page is reachable only by its link.
 'use strict';
 const http = require('http'), fs = require('fs'), zlib = require('zlib'), crypto = require('crypto'), path = require('path');
+const { pipeline } = require('stream/promises');
 
 const PORT = +process.env.PORT || 8080;
 const MODEL = process.env.ASK_MODEL || 'anthropic/claude-sonnet-5.5';
@@ -26,24 +27,57 @@ const DAILY_CAP = +process.env.ASK_DAILY_CAP || 300;          // all pages, all 
 const IP_10MIN = +process.env.ASK_PER_IP_10MIN || 10;
 const IP_DAY = +process.env.ASK_PER_IP_DAY || 60;
 
-function loadBundle() {
-  const keyHex = process.env.EXPLAINER_BUNDLE_KEY || '';
-  // bundle.enc.0, .1, … (split to stay under GitHub's file limit); a single bundle.enc still works
+// The bundle is {"<slug>/<file>": "<base64>", …} → gzip → AES-256-GCM. It is streamed (decrypt → gunzip → a tiny
+// JSON scanner) so startup holds the decoded files plus a few MB, not 4–5 full copies: the old whole-buffer loader
+// peaked at ~6x the bundle size and stopped booting once the bundle passed ~250 MB (24 Oct 2026).
+function bundleParts() {
   const parts = fs.readdirSync(__dirname).filter((f) => /^bundle\.enc\.\d+$/.test(f)).sort((a, b) => a.split('.').pop() - b.split('.').pop());
-  const files = parts.length ? parts : fs.existsSync(path.join(__dirname, 'bundle.enc')) ? ['bundle.enc'] : [];
+  return parts.length ? parts : fs.existsSync(path.join(__dirname, 'bundle.enc')) ? ['bundle.enc'] : [];
+}
+
+/** Scans `{"key":"value",…}` byte by byte across chunks; calls onEntry(key, valueBytes) per pair. */
+function createScanner(onEntry) {
+  const Q = 0x22, BS = 0x5c;
+  let state = 0, escaped = false, hasEscape = false, key = '', pieces = [];
+  const text = (bufs) => { const raw = Buffer.concat(bufs).toString('latin1'); return hasEscape ? JSON.parse(`"${raw}"`) : raw; };
+  return (chunk) => {
+    let i = 0, from = 0;
+    while (i < chunk.length) {
+      const b = chunk[i];
+      if (state === 0 || state === 2) {                      // outside a string: wait for the opening quote
+        if (b === Q) { state++; from = i + 1; pieces = []; escaped = false; hasEscape = false; }
+        i++; continue;
+      }
+      if (escaped) { escaped = false; i++; continue; }
+      if (b === BS) { escaped = true; hasEscape = true; i++; continue; }
+      if (b !== Q) { i++; continue; }
+      pieces.push(chunk.subarray(from, i));                 // closing quote of key (state 1) or value (state 3)
+      if (state === 1) { key = text(pieces); state = 2; }
+      else { onEntry(key, text(pieces)); state = 0; }
+      i++;
+    }
+    if (state === 1 || state === 3) pieces.push(Buffer.from(chunk.subarray(from)));   // string continues in the next chunk
+  };
+}
+
+async function loadBundle() {
+  const keyHex = process.env.EXPLAINER_BUNDLE_KEY || '';
+  const files = bundleParts();
   if (!keyHex || !files.length) { console.error('no bundle or key; serving nothing'); return new Map(); }
-  // Keep startup memory low (container limit 768 MB): drop each intermediate copy as soon as it is used.
-  let buf = Buffer.concat(files.map((f) => fs.readFileSync(path.join(__dirname, f))));
-  const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), buf.subarray(0, 12)); d.setAuthTag(buf.subarray(12, 28));
-  let plain = Buffer.concat([d.update(buf.subarray(28)), d.final()]); buf = null;
-  let text = zlib.gunzipSync(plain).toString('latin1'); plain = null;   // base64 + JSON are ASCII: latin1 keeps V8's one-byte string
-  const pages = JSON.parse(text); text = null;
+  const fd = fs.openSync(path.join(__dirname, files[0]), 'r'), head = Buffer.alloc(28);
+  fs.readSync(fd, head, 0, 28, 0); fs.closeSync(fd);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), head.subarray(0, 12));
+  decipher.setAuthTag(head.subarray(12, 28));
+  async function* ciphertext() {
+    for (const [n, f] of files.entries()) yield* fs.createReadStream(path.join(__dirname, f), { start: n === 0 ? 28 : 0, highWaterMark: 4 << 20 });
+  }
   const m = new Map();
-  for (const k of Object.keys(pages)) { m.set(k, Buffer.from(pages[k], 'base64')); delete pages[k]; }
+  const scan = createScanner((k, b64) => m.set(k, Buffer.from(b64, 'base64')));
+  await pipeline(ciphertext(), decipher, zlib.createGunzip(), async function (chunks) { for await (const c of chunks) scan(c); });
   console.log(`bundle: ${m.size} files, pages: ${[...new Set([...m.keys()].map((k) => k.split('/')[0]))].length}`);
   return m;
 }
-const FILES = loadBundle();
+let FILES = new Map();
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.mp3': 'audio/mpeg', '.mp4': 'video/mp4', '.svg': 'image/svg+xml', '.png': 'image/png',
@@ -146,7 +180,7 @@ async function ask(req, res) {
   json(res, 502, { error: 'Das Modell hat gerade nicht geantwortet — bitte nochmal versuchen.' });
 }
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/healthz') return json(res, 200, { ok: true, files: FILES.size });
   if (url.pathname === '/api/ask' && req.method === 'POST') return ask(req, res).catch(() => json(res, 500, { error: 'Fehler.' }));
@@ -159,4 +193,9 @@ http.createServer((req, res) => {
     return serveFile(req, res, `${m[1]}/${rel}`);
   }
   send(res, 404, 'not found', { 'Content-Type': 'text/plain' });
-}).listen(PORT, () => console.log(`explainer-pages on :${PORT}, model ${MODEL}, fallback ${FALLBACK_MODEL}`));
+});
+// A bundle that fails to decrypt must fail the deploy (exit) so the previous container keeps serving.
+loadBundle().then((m) => {
+  FILES = m;
+  server.listen(PORT, () => console.log(`explainer-pages on :${PORT}, model ${MODEL}, fallback ${FALLBACK_MODEL}`));
+}, (e) => { console.error(`bundle load failed: ${e.message}`); process.exit(1); });
