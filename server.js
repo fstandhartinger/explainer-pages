@@ -14,6 +14,14 @@ const PROVIDERS = () => [
   process.env.OPENROUTER_API_KEY && { url: 'https://openrouter.ai/api/v1/chat/completions', key: process.env.OPENROUTER_API_KEY, model: MODEL, maxTokens: 1500, extra: { 'X-Title': 'explainer-pages' } },
   process.env.CHUTES_API_KEY && { url: 'https://llm.chutes.ai/v1/chat/completions', key: process.env.CHUTES_API_KEY, model: FALLBACK_MODEL, maxTokens: 4000, extra: {} },
 ].filter(Boolean);
+// Every page links to Florian's Agent Desk (chat, voice, Claude Code about this explainer), injected at serve time so
+// already-published pages get it too. DESK_URL='' disables it.
+const DESK_URL = process.env.DESK_URL ?? 'https://desk.app.mintapis.com/';
+const deskButton = (slug) => DESK_URL ? `<a id="desk-link" href="${DESK_URL}?x=${slug}" target="_blank" rel="noopener"
+ style="position:fixed;right:16px;bottom:16px;z-index:50;display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:999px;
+ background:#8B5CF6;color:#fff;font:600 14px/1.2 system-ui,sans-serif;text-decoration:none;box-shadow:0 6px 24px rgba(139,92,246,.45)"
+ onclick="var a=document.querySelector('audio');if(a&&a.currentTime)this.href='${DESK_URL}?x=${slug}&t='+a.currentTime.toFixed(1)"
+ >&#127908; Mit dem Agenten besprechen</a>` : '';
 const DAILY_CAP = +process.env.ASK_DAILY_CAP || 300;          // all pages, all users, per UTC day
 const IP_10MIN = +process.env.ASK_PER_IP_10MIN || 10;
 const IP_DAY = +process.env.ASK_PER_IP_DAY || 60;
@@ -61,6 +69,13 @@ function serveFile(req, res, key) {
     return send(res, 206, req.method === 'HEAD' ? '' : data.subarray(start, end + 1), { ...h, 'Content-Range': `bytes ${start}-${end}/${data.length}`, 'Content-Length': end - start + 1 });
   }
   send(res, 200, req.method === 'HEAD' ? '' : data, { ...h, 'Content-Length': data.length });
+}
+
+function serveIndex(req, res, slug) {
+  const data = FILES.get(`${slug}/index.html`);
+  if (!data) return send(res, 404, 'not found', { 'Content-Type': 'text/plain' });
+  const html = data.toString('utf8').replace(/<\/body>/i, `${deskButton(slug)}</body>`);
+  send(res, 200, req.method === 'HEAD' ? '' : html, { 'Content-Type': MIME['.html'], 'Cache-Control': 'private, max-age=300' });
 }
 
 // ---- rate limits (in memory; a restart resets them, the daily cap bounds the worst case)
@@ -140,6 +155,7 @@ http.createServer((req, res) => {
     if (!m[2]) return send(res, 301, '', { Location: `/p/${m[1]}/` });
     let rel = decodeURIComponent(m[2].slice(1)) || 'index.html';
     if (rel.includes('..')) return send(res, 400, 'bad path');
+    if (rel === 'index.html' && !url.searchParams.has('embed')) return serveIndex(req, res, m[1]);
     return serveFile(req, res, `${m[1]}/${rel}`);
   }
   send(res, 404, 'not found', { 'Content-Type': 'text/plain' });
