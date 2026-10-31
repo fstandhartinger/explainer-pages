@@ -1,0 +1,29 @@
+// Pack pages/<slug>/** into bundle.enc (gzip + AES-256-GCM). Key: env EXPLAINER_BUNDLE_KEY
+// (64 hex chars) or ~/.config/explainer-pages/bundle.key. Usage: node pack.js [pagesDir] [out]
+'use strict';
+const fs = require('fs'), path = require('path'), zlib = require('zlib'), crypto = require('crypto'), os = require('os');
+const dir = path.resolve(process.argv[2] || 'pages'), out = process.argv[3] || 'bundle.enc';
+const keyHex = (process.env.EXPLAINER_BUNDLE_KEY || fs.readFileSync(path.join(os.homedir(), '.config/explainer-pages/bundle.key'), 'utf8')).trim();
+const files = {};
+(function walk(d) {
+  for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    const p = path.join(d, e.name);
+    if (e.isDirectory()) { if (!/^(stage-check|check|check-live|frames)$/.test(e.name)) walk(p); }  // QA screenshots are never served; keeps bundle < GitHub's 100 MiB
+    else if (!/\.(mp4|wav)$/.test(e.name) && !e.name.startsWith('.')) files[path.relative(dir, p).split(path.sep).join('/')] = fs.readFileSync(p).toString('base64');
+  }
+})(dir);
+const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), iv);
+// Streamed (same bytes as gzip(JSON.stringify(files))): one JSON string of all pages passed V8's ~512 MB
+// string limit on 26 Oct 2026 ("RangeError: Invalid string length").
+const gz = zlib.createGzip(), chunks = [];
+gz.on('data', (d) => chunks.push(c.update(d)));
+gz.on('end', () => {
+  const ct = Buffer.concat([...chunks, c.final()]);
+  const blob = Buffer.concat([iv, c.getAuthTag(), ct]), PART = 90e6;   // GitHub rejects files > 100 MiB, so ship parts
+  for (const f of fs.readdirSync(path.dirname(path.resolve(out)))) if (f.startsWith(path.basename(out))) fs.unlinkSync(path.join(path.dirname(path.resolve(out)), f));
+  for (let i = 0; i * PART < blob.length; i++) fs.writeFileSync(`${out}.${i}`, blob.subarray(i * PART, (i + 1) * PART));
+  console.log(`packed ${Object.keys(files).length} files -> ${out}.* (${(blob.length / 1e6).toFixed(1)} MB in ${Math.ceil(blob.length / PART)} parts)`);
+});
+const keys = Object.keys(files);
+keys.forEach((k, i) => gz.write((i ? ',' : '{') + JSON.stringify(k) + ':' + JSON.stringify(files[k])));
+gz.end(keys.length ? '}' : '{}');
