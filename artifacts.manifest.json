@@ -1,0 +1,23 @@
+{
+  "surface": "app:explainer-pages",
+  "items": {
+    "app": {
+      "id": "b3f477",
+      "kind": "app",
+      "title": "Erklärseiten",
+      "summary": "Diese Anwendung zeigt Erklärvideos mit interaktiven Erläuterungen. Einzelne Szenen und Karten lassen sich auswählen und vertiefen.",
+      "parent": null,
+      "url": "https://explainers.app.mintapis.com",
+      "selector": ".aid",
+      "refs": [
+        {
+          "kind": "code",
+          "target": "github:fstandhartinger/explainer-pages@HEAD:server.js",
+          "label": "Anwendung"
+        }
+      ],
+      "links": [],
+      "access": "internal"
+    }
+  }
+}
